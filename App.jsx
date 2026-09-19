@@ -1,5 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import './styles.css';
+
+const API_BASE = import.meta.env.VITE_API_URL || 'http://localhost:8787';
 
 function Toast({ message }) {
   return <div className={`toast ${message ? 'show' : ''}`}>{message}</div>;
@@ -15,6 +17,25 @@ function RideFinder({ notify }) {
   const [address, setAddress] = useState('');
   const [locationStatus, setLocationStatus] = useState('');
   const [matchedLocation, setMatchedLocation] = useState('');
+  const [coordinates, setCoordinates] = useState(null);
+  const [drivers, setDrivers] = useState(nearbyDrivers);
+  const watchId = useRef(null);
+
+  useEffect(() => () => {
+    if (watchId.current !== null && navigator.geolocation) navigator.geolocation.clearWatch(watchId.current);
+  }, []);
+
+  async function sendLocation(nextCoordinates) {
+    try {
+      await fetch(`${API_BASE}/api/location`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'guest-user', role: 'rider', ...nextCoordinates }),
+      });
+    } catch {
+      // The static GitHub Pages build still works without a local API.
+    }
+  }
 
   function useCurrentLocation() {
     if (!navigator.geolocation) {
@@ -23,21 +44,36 @@ function RideFinder({ notify }) {
     }
 
     setLocationStatus('Finding your location...');
-    navigator.geolocation.getCurrentPosition(
+    watchId.current = navigator.geolocation.watchPosition(
       ({ coords }) => {
+        const nextCoordinates = { lat: coords.latitude, lng: coords.longitude };
+        setCoordinates(nextCoordinates);
         setAddress(`Current location (${coords.latitude.toFixed(3)}, ${coords.longitude.toFixed(3)})`);
-        setLocationStatus('Location set successfully');
+        setLocationStatus('Location sharing is on');
+        sendLocation(nextCoordinates);
       },
       () => setLocationStatus('We could not access your location. Enter it manually.'),
-      { enableHighAccuracy: true, timeout: 10000 },
+      { enableHighAccuracy: true, maximumAge: 5000, timeout: 10000 },
     );
   }
 
-  function findDrivers(event) {
+  async function findDrivers(event) {
     event.preventDefault();
     if (!address.trim()) {
       setLocationStatus('Add an address or use your current location first.');
       return;
+    }
+    try {
+      const params = new URLSearchParams(coordinates || {});
+      const response = await fetch(`${API_BASE}/api/drivers?${params}`);
+      if (response.ok) setDrivers(await response.json());
+      await fetch(`${API_BASE}/api/rides`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ userId: 'guest-user', pickup: address.trim(), coordinates }),
+      });
+    } catch {
+      setDrivers(nearbyDrivers);
     }
     setMatchedLocation(address.trim());
     notify('Nearest drivers found. Pick the ride that works for you.');
@@ -65,17 +101,17 @@ function RideFinder({ notify }) {
         <button className="find-button" type="submit">Show nearest drivers <span>→</span></button>
         <p className="form-note">Your location is only used to find nearby rides.</p>
       </form>
-      {matchedLocation && <DriverMatches location={matchedLocation} notify={notify} />}
+      {matchedLocation && <DriverMatches location={matchedLocation} drivers={drivers} notify={notify} />}
     </div>
   );
 }
 
-function DriverMatches({ location, notify }) {
+function DriverMatches({ location, drivers, notify }) {
   return (
     <section className="matches-panel" aria-live="polite">
       <div className="matches-header"><div><span className="live-dot" /> Drivers near you</div><span className="matches-location">⌖ {location}</span></div>
       <div className="driver-list">
-        {nearbyDrivers.map((driver) => (
+        {drivers.map((driver) => (
           <article className="driver-result" key={driver.name}>
             <div className={`driver-avatar ${driver.color}`}>{driver.name.split(' ').map((part) => part[0]).join('')}</div>
             <div className="driver-info"><h3>{driver.name} <span>★ {driver.rating}</span></h3><p>{driver.car} · {driver.distance} away</p></div>
@@ -98,8 +134,17 @@ function DriverCard({ notify }) {
     setForm({ ...form, [event.target.name]: event.target.value });
   }
 
-  function submitBooking(event) {
+  async function submitBooking(event) {
     event.preventDefault();
+    try {
+      await fetch(`${API_BASE}/api/driver-applications`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(form),
+      });
+    } catch {
+      // Keep the form useful when the frontend is hosted without the API.
+    }
     notify(`Thanks. We will connect you with customers in ${form.city || 'your area'}.`);
   }
 
@@ -150,6 +195,18 @@ function DriverCard({ notify }) {
 export default function App() {
   const [toast, setToast] = useState('');
 
+  useEffect(() => {
+    let events;
+    try {
+      events = new EventSource(`${API_BASE}/api/events`);
+      events.addEventListener('ride.created', () => notify('A new ride request was added to the live network.'));
+      events.addEventListener('driver.application.created', () => notify('Your driver application is now in review.'));
+    } catch {
+      events = null;
+    }
+    return () => events?.close();
+  }, []);
+
   function notify(message) {
     setToast(message);
     window.setTimeout(() => setToast(''), 2600);
@@ -195,8 +252,17 @@ export default function App() {
           </div>
         </section>
 
-        <section className="container" id="safety"><div className="banner"><div><div className="eyebrow"><i /> Want to drive instead?</div><h2>More freedom. More meaningful miles.</h2><p>Drivers can join the same network, see nearby customer requests and choose when to accept a trip.</p><a className="primary" href="#drive">Drive with us&nbsp; →</a></div><div className="route-illustration"><div className="route-label"><span className="pulse" /> 24 customer requests nearby</div><div className="car" /></div></div></section>
-        <section className="container driver-join" id="drive"><DriverCard notify={notify} /></section>
+        <section className="section container safety-promise" id="safety">
+          <div className="section-head"><h2>Our safety promise.</h2><p className="section-intro">Trust is built into every Milewise match, from the driver review to the moment you arrive.</p></div>
+          <div className="safety-grid">
+            <article className="safety-item"><span className="safety-icon">✓</span><h3>Drivers are checked</h3><p>We verify identity, driving documents and vehicle details before a driver can accept customer trips. Reviews and reports are monitored continuously.</p></article>
+            <article className="safety-item"><span className="safety-icon">⌖</span><h3>Trips stay visible</h3><p>With permission, the app shares live trip location with the customer and our support team. Location sharing stops when the trip ends.</p></article>
+            <article className="safety-item"><span className="safety-icon">♡</span><h3>Support is close</h3><p>Customer and driver profiles, trip details and match activity are recorded so our team can respond quickly when something feels wrong.</p></article>
+          </div>
+          <div className="safety-note"><strong>Your location belongs to you.</strong><span>We collect only what is needed to match and support your ride, protect it in transit and never sell it to advertisers.</span></div>
+        </section>
+        <section className="container" id="drive"><div className="banner"><div><div className="eyebrow"><i /> Want to drive instead?</div><h2>More freedom. More meaningful miles.</h2><p>Drivers can join the same network, see nearby customer requests and choose when to accept a trip.</p><a className="primary" href="#driver-join">Drive with us&nbsp; →</a></div><div className="route-illustration"><div className="route-label"><span className="pulse" /> 24 customer requests nearby</div><div className="car" /></div></div></section>
+        <section className="container driver-join" id="driver-join"><DriverCard notify={notify} /></section>
       </main>
 
       <footer><div className="container footer-inner"><span>© 2026 Milewise</span><div className="footer-links"><a href="#">Help</a><a href="#">Terms</a><a href="#">Privacy</a></div></div></footer>
